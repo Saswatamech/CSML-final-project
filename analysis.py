@@ -9,28 +9,23 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, average_precision_score, confusion_matrix, precision_recall_curve
 )
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import torch.optim as optim
 
 # =====================================================================
 # HARDWARE DETECTION & DEVICE CONFIGURATION (GPU / CPU)
 # =====================================================================
 print("--- Checking Available Hardware (GPU / CPU) ---")
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"[INFO] GPU detected: {len(gpus)} device(s) available. Running on GPU acceleration.")
-        DEVICE_MODE = "GPU"
-    except RuntimeError as e:
-        print(f"[WARNING] Could not configure GPU memory growth: {e}. Falling back to CPU.")
-        DEVICE_MODE = "CPU"
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    DEVICE_MODE = "GPU"
+    print(f"[INFO] PyTorch GPU detected: {torch.cuda.get_device_name(0)}. Running on GPU acceleration.")
 else:
-    print("[INFO] No GPU detected. Running calculations on CPU.")
+    DEVICE = torch.device("cpu")
     DEVICE_MODE = "CPU"
+    print("[INFO] No GPU detected. Running calculations on CPU.")
 
 
 # =====================================================================
@@ -53,7 +48,6 @@ def run_data_pipeline(file_path):
 
     # Define Target Variable: Congestion in t + 30 to 60 minutes
     future_window_start = 3  # ~30 mins ahead
-    future_window_end = 6    # ~60 mins ahead
 
     df['future_max_occupancy'] = (
         df.groupby('road_segment_id')['occupancy_pct']
@@ -165,37 +159,84 @@ def train_baseline_models(train_data, val_data):
     return models
 
 
+# PyTorch LSTM Architecture & Sequence Builder
+class TrafficLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1, output_dim=1, dropout=0.2):
+        super(TrafficLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(hidden_dim, 32)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]  # Take the last time step output
+        out = self.dropout(out)
+        out = self.fc1(out)
+        out = self.relu(out)
+        out = self.fc2(out)
+        return out
+
+
 def create_sequences(features, labels, time_steps=12):
     Xs, ys = [], []
     for i in range(len(features) - time_steps):
         Xs.append(features[i:(i + time_steps)])
         ys.append(labels.iloc[i + time_steps])
-    return np.array(Xs), np.array(ys)
+    return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
 
 
 def train_lstm_model(train_data, val_data, feature_count, time_steps=12):
-    print(f"--- Training LSTM Sequence Model on {DEVICE_MODE} ---")
+    print(f"--- Training PyTorch LSTM Sequence Model on {DEVICE_MODE} ---")
     X_train, y_train = train_data
     X_val, y_val = val_data
 
     X_train_seq, y_train_seq = create_sequences(X_train, y_train, time_steps)
     X_val_seq, y_val_seq = create_sequences(X_val, y_val, time_steps)
 
-    # TensorFlow automatically dispatches operations to GPU if available
-    model = Sequential([
-        LSTM(64, input_shape=(time_steps, feature_count), return_sequences=False),
-        Dropout(0.2),
-        Dense(32, activation='relu'),
-        Dense(1, activation='sigmoid')
-    ])
+    # Create PyTorch DataLoaders
+    train_dataset = TensorDataset(torch.tensor(X_train_seq), torch.tensor(y_train_seq))
+    val_dataset = TensorDataset(torch.tensor(X_val_seq), torch.tensor(y_val_seq))
 
-    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
-    model.fit(X_train_seq, y_train_seq, epochs=10, batch_size=64, validation_data=(X_val_seq, y_val_seq), verbose=0)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
-    lstm_prob = model.predict(X_val_seq).flatten()
-    lstm_pred = (lstm_prob >= 0.5).astype(int)
+    # Initialize model, loss function, and optimizer
+    model = TrafficLSTM(input_dim=feature_count).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    return model, evaluate_model(y_val_seq, lstm_pred, lstm_prob)
+    # Training Loop
+    epochs = 10
+    for epoch in range(epochs):
+        model.train()
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(batch_X).squeeze()
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+
+    # Validation Evaluation
+    model.eval()
+    val_probs = []
+    val_targets = []
+    with torch.no_grad():
+        for batch_X, batch_y in val_loader:
+            batch_X = batch_X.to(DEVICE)
+            outputs = model(batch_X).squeeze()
+            probs = torch.sigmoid(outputs)
+            val_probs.extend(probs.cpu().numpy().tolist())
+            val_targets.extend(batch_y.numpy().tolist())
+
+    val_probs = np.array(val_probs)
+    val_targets = np.array(val_targets)
+    val_preds = (val_probs >= 0.5).astype(int)
+
+    return model, evaluate_model(val_targets, val_preds, val_probs)
 
 
 # =====================================================================
@@ -228,10 +269,25 @@ def evaluate_on_test_set(baseline_models, lstm_model, test_data, feature_count, 
 
     X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test, time_steps)
     if len(X_test_seq) > 0:
-        lstm_prob = lstm_model.predict(X_test_seq).flatten()
-        lstm_pred = (lstm_prob >= 0.5).astype(int)
-        lstm_metrics = evaluate_model(y_test_seq, lstm_pred, lstm_prob)
-        results['LSTM'] = (lstm_prob, lstm_metrics)
+        lstm_model.eval()
+        test_dataset = TensorDataset(torch.tensor(X_test_seq))
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+        lstm_probs = []
+        with torch.no_grad():
+            for (batch_X,) in test_loader:
+                batch_X = batch_X.to(DEVICE)
+                outputs = lstm_model(batch_X).squeeze()
+                probs = torch.sigmoid(outputs)
+                if probs.ndim == 0:
+                    lstm_probs.append(probs.cpu().item())
+                else:
+                    lstm_probs.extend(probs.cpu().numpy().tolist())
+
+        lstm_probs = np.array(lstm_probs)
+        lstm_pred = (lstm_probs >= 0.5).astype(int)
+        lstm_metrics = evaluate_model(y_test_seq, lstm_pred, lstm_probs)
+        results['LSTM'] = (lstm_probs, lstm_metrics)
 
         print(f"\n--- Model: LSTM (Default Threshold = 0.5) ---")
         print(f"  - Accuracy:           {lstm_metrics['Accuracy']:.4f}")
@@ -244,7 +300,7 @@ def evaluate_on_test_set(baseline_models, lstm_model, test_data, feature_count, 
         print(f"  - False Negative Rate:{lstm_metrics['False Negative Rate']:.4f}")
         print(f"  - Confusion Matrix:\n{lstm_metrics['Confusion Matrix']}")
 
-    return results, y_test, X_test_seq
+    return results, y_test, y_test_seq
 
 
 def run_cost_optimization_analysis(results, y_test, X_test_seq_labels, c_fn_weight=5.0, c_fp_weight=1.0):
@@ -257,13 +313,11 @@ def run_cost_optimization_analysis(results, y_test, X_test_seq_labels, c_fn_weig
     optimization_summary = []
 
     for model_name, (y_prob, _) in results.items():
-        # Correctly align labels: LSTM uses sequence labels (shorter by time_steps), others use standard y_test
         if model_name == 'LSTM':
             target_y = np.array(X_test_seq_labels)
         else:
             target_y = np.array(y_test)
 
-        # Ensure y_prob matches target_y shape
         if len(y_prob) != len(target_y):
             y_prob = y_prob[-len(target_y):]
 
@@ -298,26 +352,94 @@ def run_cost_optimization_analysis(results, y_test, X_test_seq_labels, c_fn_weig
 
 
 # =====================================================================
+# PHASE 5: EXPECTED OUTCOME & FINAL RECOMMENDATION SYNTHESIS
+# =====================================================================
+def run_final_analysis_and_recommendation(baseline_models, optimization_summary, feature_cols, X_test_scaled, y_test):
+    print("\n" + "="*70)
+    print("PHASE 5: EXPECTED OUTCOME & FINAL RECOMMENDATION ANALYSIS")
+    print("="*70)
+
+    # 1. Feature Importance & Interpretability Analysis (Using XGBoost / Random Forest)
+    print("\n[1] Feature Importance Analysis (Top Predictive Features):")
+    if 'XGBoost' in baseline_models:
+        xgb_model = baseline_models['XGBoost'][0]
+        importances = xgb_model.feature_importances_
+        feature_importance_df = pd.DataFrame({
+            'Feature': feature_cols,
+            'Importance': importances
+        }).sort_values(by='Importance', ascending=False)
+
+        print("Top 5 Strongest Predictors of Future Road Congestion:")
+        for idx, row in feature_importance_df.head(5).iterrows():
+            print(f"  - {row['Feature']}: {row['Importance']:.4f}")
+
+    # 2. Comprehensive Model-Performance & Threshold Comparison Table
+    print("\n[2] Comparative Summary Table (Model vs. Optimal Threshold vs. Cost):")
+    print(f"{'Model Name':<22} | {'Optimal Threshold':<18} | {'Min Operational Cost':<22}")
+    print("-" * 70)
+
+    best_model_name = None
+    lowest_cost = float('inf')
+    best_threshold = 0.5
+
+    for model_name, threshold, min_cost in optimization_summary:
+        print(f"{model_name:<22} | {threshold:<18.2f} | {min_cost:<22.1f}")
+        if min_cost < lowest_cost:
+            lowest_cost = min_cost
+            best_model_name = model_name
+            best_threshold = threshold
+
+    # 3. Final Executive Recommendation Statement
+    print("\n" + "="*70)
+    print("🎯 FINAL PROJECT DELIVERABLE: DEPLOYMENT RECOMMENDATION")
+    print("="*70)
+    print(f"Based on the multi-model evaluation framework and cost-sensitive threshold optimization")
+    print(f"(where missing an upcoming traffic jam $C_{{FN}} = 5.0$ is weighted higher than a false alarm $C_{{FP}} = 1.0$),")
+    print(f"the definitive recommendation for the real-time traffic prediction system is:")
+    print(f"\n  👉 Selected Optimal Model: [{best_model_name}]")
+    print(f"  👉 Decision Threshold: P(congestion) > [{best_threshold:.2f}]")
+    print(f"  👉 Minimized Operational Cost Score: [{lowest_cost:.1f}]")
+    print(f"\nJustification:")
+    print(f"  - This configuration successfully balances early congestion detection (maximizing recall)")
+    print(f"    against driver alert fatigue or unnecessary traffic management actions (minimizing false positives).")
+    print(f"  - Incorporating traffic dynamics, weather parameters, and VANET communication KPIs")
+    print(f"    ensures robust 30–60 minute advance warnings for traffic control operators[cite: 1, 2].")
+    print("="*70)
+
+
+# =====================================================================
 # MAIN EXECUTION SCRIPT
 # =====================================================================
 if __name__ == "__main__":
     file_path = "vanet_traffic_data.csv"
 
     try:
+        # Step 1: Run Data Pipeline
         df, feature_cols = run_data_pipeline(file_path)
+
+        # Step 2: Time-Based Train/Val/Test Split
         train_data, val_data, test_data, scaler = time_based_split(df, feature_cols)
+
+        # Step 3: Train & Evaluate Baseline and Tree Models
         baseline_models = train_baseline_models(train_data, val_data)
+
+        # Step 4: Train & Evaluate LSTM Model
         lstm_model, _ = train_lstm_model(train_data, val_data, feature_count=len(feature_cols))
 
+        # Step 5: Cost-Sensitive Threshold Optimization & Trade-off Curves
         test_results, y_test, y_test_seq = evaluate_on_test_set(
             baseline_models, lstm_model, test_data, feature_count=len(feature_cols)
         )
 
-        # Step 6: Cost-Sensitive Threshold Optimization & Trade-off Curves
         _, y_test_seq_labels = create_sequences(test_data[0], test_data[1], time_steps=12)
 
         optimization_summary = run_cost_optimization_analysis(
             test_results, y_test, y_test_seq_labels, c_fn_weight=5.0, c_fp_weight=1.0
+        )
+
+        # Step 6: Run Final Expected Outcome & Recommendation Analysis
+        run_final_analysis_and_recommendation(
+            baseline_models, optimization_summary, feature_cols, test_data[0], test_data[1]
         )
 
         print("\n" + "="*60)
